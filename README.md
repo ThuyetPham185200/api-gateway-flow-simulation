@@ -1,6 +1,6 @@
 # api-gateway-flow-simulation
 
-## 1. Run gateway.go and internal_service.go in seperate terminal
+# 1. Run gateway.go and internal_service.go in seperate terminal
 
 # 2. curl from user to simulated request to test
 ## 1. Login
