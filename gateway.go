@@ -143,7 +143,16 @@ func featureRateLimiter(topic string) bool { return true }
 // ===== Routing =====
 
 func routeToInternalService(req RawRequestData, requestID string, start time.Time) GatewayResult {
-	targetURL := "http://localhost:9090" + req.Path
+	targetURL := ""
+	switch req.Topic {
+	case "auth/login", "auth/register":
+		targetURL = "http://localhost:9090" + req.Path
+	case "profile/get":
+		targetURL = "http://localhost:9091" + req.Path
+	case "profile/update":
+		targetURL = "http://localhost:9092" + req.Path
+	}
+
 	ctx, cancel := context.WithTimeout(req.Ctx, 3*time.Second)
 	defer cancel()
 
