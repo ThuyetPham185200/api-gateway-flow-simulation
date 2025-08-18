@@ -5,17 +5,17 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"fmt"
 	"io"
 	"log"
 	"net/http"
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/gorilla/mux"
 )
 
 // ===== Models =====
-
 type RawRequestData struct {
 	Ctx     context.Context
 	Method  string
@@ -27,7 +27,6 @@ type RawRequestData struct {
 	Token   string
 	ReplyCh chan GatewayResult
 }
-
 type GatewayResult struct {
 	StatusCode int
 	Headers    http.Header
@@ -35,8 +34,26 @@ type GatewayResult struct {
 }
 
 // ===== Queue & Worker =====
-
 var requestQueue = make(chan RawRequestData, 1024)
+
+// Gom tất cả service groups
+var serviceGroups = []ServiceGroup{
+	AuthService,
+	UserService,
+	PostsService,
+	ReactionsService,
+}
+
+var topicAuthMap = make(map[string]bool)
+
+func initTopicAuthMap() {
+	for _, sg := range serviceGroups {
+		for _, ep := range sg.Endpoints {
+			topic := sg.Name + "/" + ep.Name
+			topicAuthMap[topic] = ep.RequireAuth
+		}
+	}
+}
 
 func startWorkers(n int) {
 	for i := 0; i < n; i++ {
@@ -49,21 +66,27 @@ func startWorkers(n int) {
 }
 
 // ===== Handler =====
-
 func main() {
+
+	initTopicAuthMap()
 	startWorkers(4)
 
-	// Các endpoint
-	http.HandleFunc("/auth/login", makeHandler("auth/login"))
-	http.HandleFunc("/auth/register", makeHandler("auth/register"))
-	http.HandleFunc("/profile/get", makeHandler("profile/get"))
-	http.HandleFunc("/profile/update", makeHandler("profile/update"))
+	// Khởi tạo router
+	router := mux.NewRouter()
+
+	// Đăng ký route cho từng endpoint
+	for _, sg := range serviceGroups {
+		for _, ep := range sg.Endpoints {
+			topic := sg.Name + "/" + ep.Name
+			router.HandleFunc(ep.Path, makeHandler(topic)).Methods(ep.Method)
+			log.Printf("Registered route: %s %s -> topic %s", ep.Method, ep.Path, topic)
+		}
+	}
 
 	log.Println("🚀 API Gateway running at :8080")
-	log.Fatal(http.ListenAndServe(":8080", nil))
+	log.Fatal(http.ListenAndServe(":8080", router))
 }
 
-// Helper tạo handler để tránh lặp code
 func makeHandler(topic string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		var body []byte
@@ -73,12 +96,19 @@ func makeHandler(topic string) http.HandlerFunc {
 			body = b
 		}
 
+		// Lấy path params từ mux
+		vars := mux.Vars(r)
+		pathWithParams := r.URL.Path
+		for k, v := range vars {
+			// Có thể replace {param} trong path gốc bằng value thực
+			pathWithParams = replaceParam(pathWithParams, k, v)
+		}
+
 		replyCh := make(chan GatewayResult, 1)
-		fmt.Println("================> %p", replyCh)
 		job := RawRequestData{
 			Ctx:     r.Context(),
 			Method:  r.Method,
-			Path:    r.URL.Path,
+			Path:    pathWithParams,
 			Header:  r.Header.Clone(),
 			Body:    body,
 			IP:      r.RemoteAddr,
@@ -109,6 +139,11 @@ func makeHandler(topic string) http.HandlerFunc {
 	}
 }
 
+// helper: thay {param} bằng value thực
+func replaceParam(path, param, value string) string {
+	return strings.ReplaceAll(path, "{"+param+"}", value)
+}
+
 // ===== Pipeline =====
 
 func process(req RawRequestData) {
@@ -120,9 +155,12 @@ func process(req RawRequestData) {
 		return
 	}
 
-	if !jwtChecker(req.Token) {
-		req.ReplyCh <- normalizedError(requestID, http.StatusUnauthorized, "UNAUTHENTICATED", "Unauthorized (JWT)", time.Since(start))
-		return
+	// Chỉ check JWT nếu endpoint cần auth
+	if topicAuthMap[req.Topic] {
+		if !jwtChecker(req.Token) {
+			req.ReplyCh <- normalizedError(requestID, http.StatusUnauthorized, "UNAUTHENTICATED", "Unauthorized (JWT)", time.Since(start))
+			return
+		}
 	}
 
 	if !featureRateLimiter(req.Topic) {
@@ -143,14 +181,10 @@ func featureRateLimiter(topic string) bool { return true }
 // ===== Routing =====
 
 func routeToInternalService(req RawRequestData, requestID string, start time.Time) GatewayResult {
-	targetURL := ""
-	switch req.Topic {
-	case "auth/login", "auth/register":
-		targetURL = "http://localhost:9090" + req.Path
-	case "profile/get":
-		targetURL = "http://localhost:9091" + req.Path
-	case "profile/update":
-		targetURL = "http://localhost:9092" + req.Path
+	// Lấy targetURL từ topic
+	targetURL := getTargetURL(req)
+	if targetURL == "" {
+		return normalizedError(requestID, http.StatusBadGateway, "NO_ROUTE", "No internal service for topic "+req.Topic, time.Since(start))
 	}
 
 	ctx, cancel := context.WithTimeout(req.Ctx, 3*time.Second)
@@ -257,4 +291,17 @@ func writePlainError(w http.ResponseWriter, code int, msg string) {
 
 func newRequestID() string {
 	return strconv.FormatInt(time.Now().UnixNano(), 10)
+}
+
+func getTargetURL(req RawRequestData) string {
+	for _, sg := range serviceGroups {
+		for _, ep := range sg.Endpoints {
+			topic := sg.Name + "/" + ep.Name
+			if req.Topic == topic {
+				return "http://" + sg.IP + ":" + strconv.Itoa(sg.Port) + req.Path
+			}
+		}
+	}
+	// fallback
+	return ""
 }
