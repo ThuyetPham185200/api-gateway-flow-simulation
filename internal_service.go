@@ -1,12 +1,14 @@
 package main
 
 import (
-	"bytes"
 	"encoding/json"
 	"fmt"
-	"io"
 	"log"
 	"net/http"
+	"os"
+	"os/signal"
+	"sync/atomic"
+	"syscall"
 	"time"
 )
 
@@ -15,6 +17,25 @@ type InternalService struct {
 	Name      string
 	Port      int
 	Endpoints map[string]http.HandlerFunc
+}
+
+var reqCount int64 // global counter
+var stopRequestMonitor = make(chan struct{})
+
+func startMonitor(stop <-chan struct{}) {
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			count := atomic.SwapInt64(&reqCount, 0)
+			fmt.Printf("🔥 Requests per second: %d\n", count)
+		case <-stop: // stop signal received
+			fmt.Println("🛑 Monitor stopped")
+			return
+		}
+	}
 }
 
 func main() {
@@ -218,6 +239,7 @@ func main() {
 			},
 		},
 	}
+	go startMonitor(stopRequestMonitor)
 
 	// ===== Khởi chạy các service song song =====
 	services := []*InternalService{&authService, &userService, &postsService, &reactionsService}
@@ -225,7 +247,13 @@ func main() {
 		go s.Start()
 	}
 
-	select {} // block chính
+	// 3. Graceful shutdown on SIGINT/SIGTERM
+	stop := make(chan os.Signal, 1)
+	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
+
+	<-stop
+	log.Println("⚠️ Shutting down API Gateway...")
+	close(stopRequestMonitor)
 }
 
 // ===== Method Start cho InternalService =====
@@ -241,16 +269,17 @@ func (s *InternalService) Start() {
 
 // ===== Helpers =====
 func logRequest(serviceName string, r *http.Request) {
-	log.Printf("====== %s Received ======", serviceName)
-	log.Printf("Method: %s URL: %s", r.Method, r.URL.String())
-	for k, v := range r.Header {
-		log.Printf("%s: %v", k, v)
-	}
-	body, _ := io.ReadAll(r.Body)
-	r.Body.Close()
-	log.Println("Body:", string(body))
-	log.Println("=================================")
-	r.Body = io.NopCloser(bytes.NewReader(body))
+	atomic.AddInt64(&reqCount, 1)
+	// log.Printf("====== %s Received ======", serviceName)
+	// log.Printf("Method: %s URL: %s", r.Method, r.URL.String())
+	// for k, v := range r.Header {
+	// 	log.Printf("%s: %v", k, v)
+	// }
+	// body, _ := io.ReadAll(r.Body)
+	// r.Body.Close()
+	// log.Println("Body:", string(body))
+	// log.Println("=================================")
+	// r.Body = io.NopCloser(bytes.NewReader(body))
 }
 
 func writeJSON(w http.ResponseWriter, v interface{}) {
